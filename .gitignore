@@ -1,0 +1,32 @@
+
+# Local .terraform directories
+.terraform
+
+# Managed terraform state files
+*.tfstate
+*.tfstate.backup
+*.tfstate.*
+
+# Exclude override files
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+
+# visualizer
+.pluralith
+
+# vscode
+.vscode
+settings.json
+
+# Crash log files
+crash.log
+crash.*.log
+
+# Exclude sensitive variables files
+*.tfvars
+!*.tfvars.example
+
+# downloaded objects, local databases, or cached text files
+data/
