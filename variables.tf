@@ -10,8 +10,8 @@ variable "instance_type" {
   default     = "t2.micro"
 }
 
-variable "ingress_port" {
+variable "server_port" {
   description = "ingress port to access ec2 instance"
-  type = number
-  default = 8080
+  type        = number
+  default     = 8080
 }

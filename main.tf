@@ -24,8 +24,8 @@ resource "aws_security_group" "instance" {
   vpc_id = module.vpc.vpc_id # Connects to your existing VPC module
 
   ingress {
-    from_port   = var.ingress_port
-    to_port     = var.ingress_port
+    from_port   = var.server_port
+    to_port     = var.server_port
     protocol    = "tcp"
     cidr_blocks = ["0.0.0.0/0"]
   }
@@ -39,6 +39,24 @@ resource "aws_security_group" "instance" {
   }
 }
 
+# 9. ALB Security Group
+resource "aws_security_group" "alb" {
+  name = "terraform-example-alb"
+
+  ingress {
+    from_port   = 80
+    to_port     = 80
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+}
 
 data "aws_ami" "ubuntu" {
   most_recent = true
@@ -51,41 +69,153 @@ data "aws_ami" "ubuntu" {
   owners = ["099720109477"] # Canonical
 }
 
-resource "aws_instance" "app_server" {
-  ami           = data.aws_ami.ubuntu.id
+resource "aws_launch_template" "example" {
+  name_prefix   = "example-"
+  image_id      = data.aws_ami.ubuntu.id
   instance_type = var.instance_type
 
-  # vpc_security_group_ids = [module.vpc.default_security_group_id]
-  vpc_security_group_ids = [aws_security_group.instance.id]
-  # subnet_id              = module.vpc.private_subnets[0]
-  subnet_id = module.vpc.public_subnets[0]
-
-  user_data = <<-EOF
-              #!/bin/bash
-              echo "Hello, World" > index.html
-              nohup busybox httpd -f -p ${var.ingress_port} &
-              EOF
-
-  user_data_replace_on_change = true
-
-  # DYNAMIC AUTOMATION FIX: Automatically finds and configures the active Floci container
-  provisioner "local-exec" {
-    command = <<EOT
-      sleep 8
-      CONTAINER_ID=$(docker ps --filter "name=floci-ec2-i-" --format "{{.Names}}" | head -n 1)
-      echo "Targeting running Floci container: $CONTAINER_ID"
-      docker exec $CONTAINER_ID bash -c "apt-get update && apt-get install -y busybox && echo 'Hello, World' > index.html && nohup busybox httpd -f -p 8080 &"
-    EOT
+  # Security groups are passed inside the network_interfaces block
+  network_interfaces {
+    associate_public_ip_address = true
+    security_groups             = [aws_security_group.instance.id]
   }
 
-  # tags = {
-  #   Name = var.instance_name
-  # }
-
-  tags = merge(
-    local.common_tags,
-    { Name = "${local.project}-${var.instance_name}" } # Adds a specific Name tag on top of common tags
+  # User data must be base64 encoded in a launch template
+  user_data = base64encode(<<-EOF
+              #!/bin/bash
+              echo "Hello, World" > index.html
+              nohup busybox httpd -f -p ${var.server_port} &
+              EOF
   )
+
+  # Recommended: Prevent resource destruction issues when updating Auto Scaling Groups
+  lifecycle {
+    create_before_destroy = true
+  }
+}
+
+resource "null_resource" "bootstrap_floci_instances" {
+  # This ensures the provisioner runs ONLY after the ASG has fully finished creating the containers
+  depends_on = [aws_autoscaling_group.example]
+
+  provisioner "local-exec" {
+    command = <<EOT
+      echo "Waiting 5 seconds for Floci containers to fully settle..."
+      sleep 5
+      
+      # Find all active container IDs matching your Floci EC2 instances
+      CONTAINERS=$(docker ps --filter "name=floci-ec2-i-" --format "{{.ID}}")
+      
+      for CONTAINER in $CONTAINERS; do
+        echo "Bootstrapping web server inside Floci container: $CONTAINER"
+        
+        # 1. Install busybox and prepare files synchronously
+        docker exec $CONTAINER bash -c "apt-get update && apt-get install -y busybox && mkdir -p /var/www && echo 'Hello, World' > /var/www/index.html"
+        
+        # 2. Start the webserver DETACHED (-d) so Docker keeps the background process alive
+        docker exec -d $CONTAINER busybox httpd -f -p 8080 -h /var/www
+      done
+    EOT
+  }
+}
+
+
+# 2. Updated Auto Scaling Group using Launch Template syntax
+resource "aws_autoscaling_group" "example" {
+  vpc_zone_identifier = data.aws_subnets.default.ids
+  target_group_arns   = [aws_lb_target_group.asg.arn]
+  health_check_type   = "ELB"
+
+  min_size = 2
+  max_size = 10
+
+  # Point to the launch template instead of launch_configuration
+  launch_template {
+    id      = aws_launch_template.example.id
+    version = "$Latest"
+  }
+
+  tag {
+    key                 = "Name"
+    value               = "terraform-asg-example"
+    propagate_at_launch = true
+  }
+
+  # Ensures the ASG rolls over instances seamlessly when the template updates
+  lifecycle {
+    create_before_destroy = true
+  }
+}
+
+# 3. Networking Data Sources
+data "aws_vpc" "default" {
+  default = true
+}
+
+data "aws_subnets" "default" {
+  filter {
+    name   = "vpc-id"
+    values = [data.aws_vpc.default.id]
+  }
+}
+
+# 5. Application Load Balancer
+resource "aws_lb" "example" {
+  name               = "terraform-asg-example"
+  load_balancer_type = "application"
+  subnets            = data.aws_subnets.default.ids
+  security_groups    = [aws_security_group.alb.id]
+}
+
+# 6. ALB Listener
+resource "aws_lb_listener" "http" {
+  load_balancer_arn = aws_lb.example.arn
+  port              = 80
+  protocol          = "HTTP"
+
+  default_action {
+    type = "fixed-response"
+    fixed_response {
+      content_type = "text/plain"
+      message_body = "404: page not found"
+      status_code  = 404
+    }
+  }
+}
+
+# 7. ALB Listener Rule
+resource "aws_lb_listener_rule" "asg" {
+  listener_arn = aws_lb_listener.http.arn
+  priority     = 100
+
+  condition {
+    path_pattern {
+      values = ["*"]
+    }
+  }
+
+  action {
+    type             = "forward"
+    target_group_arn = aws_lb_target_group.asg.arn
+  }
+}
+
+# 8. ALB Target Group
+resource "aws_lb_target_group" "asg" {
+  name     = "terraform-asg-example"
+  port     = var.server_port
+  protocol = "HTTP"
+  vpc_id   = data.aws_vpc.default.id
+
+  health_check {
+    path                = "/"
+    protocol            = "HTTP"
+    matcher             = "200"
+    interval            = 15
+    timeout             = 3
+    healthy_threshold   = 2
+    unhealthy_threshold = 2
+  }
 }
 
 # ----------------------------
