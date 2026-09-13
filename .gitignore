@@ -30,3 +30,10 @@ crash.*.log
 
 # downloaded objects, local databases, or cached text files
 data/
+
+# Terraform CLI configuration file
+.terraformrc
+terraform.rc
+
+# macOS system file
+.DS_Store

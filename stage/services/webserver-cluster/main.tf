@@ -1,5 +1,16 @@
+terraform {
+  required_providers {
+    aws = {
+      source  = "hashicorp/aws"
+      version = "~> 6.28"
+    }
+  }
+
+  required_version = ">= 1.15.8"
+}
+
 provider "aws" {
-  region = "us-east-1"
+  region = var.aws_region
 }
 
 module "vpc" {
@@ -10,8 +21,8 @@ module "vpc" {
   cidr = "10.0.0.0/16"
 
   azs             = ["us-east-1a", "us-east-1b", "us-east-1c"]
-  private_subnets = ["10.0.1.0/24", "10.0.2.0/24"]
-  public_subnets  = ["10.0.101.0/24"]
+  private_subnets = ["10.0.1.0/24", "10.0.2.0/24", "10.0.3.0/24"]
+  public_subnets  = ["10.0.101.0/24", "10.0.102.0/24", "10.0.103.0/24"]
 
   enable_dns_hostnames = true
 
@@ -20,7 +31,7 @@ module "vpc" {
 
 # security group to allow the EC2 Instance to receive traffic on port 8080
 resource "aws_security_group" "instance" {
-  name   = "terraform-example-instance"
+  name   = var.instance_security_group_name
   vpc_id = module.vpc.vpc_id # Connects to your existing VPC module
 
   ingress {
@@ -41,7 +52,7 @@ resource "aws_security_group" "instance" {
 
 # 9. ALB Security Group
 resource "aws_security_group" "alb" {
-  name = "terraform-example-alb"
+  name = var.alb_security_group_name
 
   ingress {
     from_port   = 80
@@ -80,13 +91,12 @@ resource "aws_launch_template" "example" {
     security_groups             = [aws_security_group.instance.id]
   }
 
-  # User data must be base64 encoded in a launch template
-  user_data = base64encode(<<-EOF
-              #!/bin/bash
-              echo "Hello, World" > index.html
-              nohup busybox httpd -f -p ${var.server_port} &
-              EOF
-  )
+  # Render the User Data script as a template
+  user_data = base64encode(templatefile("user-data.sh", {
+    server_port = var.server_port
+    db_address  = data.terraform_remote_state.db.outputs.address
+    db_port     = data.terraform_remote_state.db.outputs.port
+  }))
 
   # Recommended: Prevent resource destruction issues when updating Auto Scaling Groups
   lifecycle {
@@ -122,7 +132,7 @@ resource "null_resource" "bootstrap_floci_instances" {
 
 # 2. Updated Auto Scaling Group using Launch Template syntax
 resource "aws_autoscaling_group" "example" {
-  vpc_zone_identifier = data.aws_subnets.default.ids
+  vpc_zone_identifier = module.vpc.private_subnets
   target_group_arns   = [aws_lb_target_group.asg.arn]
   health_check_type   = "ELB"
 
@@ -147,23 +157,11 @@ resource "aws_autoscaling_group" "example" {
   }
 }
 
-# 3. Networking Data Sources
-data "aws_vpc" "default" {
-  default = true
-}
-
-data "aws_subnets" "default" {
-  filter {
-    name   = "vpc-id"
-    values = [data.aws_vpc.default.id]
-  }
-}
-
 # 5. Application Load Balancer
 resource "aws_lb" "example" {
-  name               = "terraform-asg-example"
+  name               = var.alb_name
   load_balancer_type = "application"
-  subnets            = data.aws_subnets.default.ids
+  subnets            = module.vpc.public_subnets
   security_groups    = [aws_security_group.alb.id]
 }
 
@@ -202,10 +200,10 @@ resource "aws_lb_listener_rule" "asg" {
 
 # 8. ALB Target Group
 resource "aws_lb_target_group" "asg" {
-  name     = "terraform-asg-example"
+  name     = var.alb_name
   port     = var.server_port
   protocol = "HTTP"
-  vpc_id   = data.aws_vpc.default.id
+  vpc_id   = module.vpc.vpc_id
 
   health_check {
     path                = "/"
@@ -218,54 +216,25 @@ resource "aws_lb_target_group" "asg" {
   }
 }
 
-# ----------------------------
+data "terraform_remote_state" "db" {
+  backend = "s3"
 
-# 1. S3 Bucket for State Storage
-resource "aws_s3_bucket" "terraform_state" {
-  bucket        = "enterprise-tf-state-9yo-xp" # Must be globally unique
-  force_destroy = false                        # Prevent accidental deletion of state
+  config = {
+    bucket = var.db_remote_state_bucket
+    key    = var.db_remote_state_key
+    region = var.aws_region
 
-  lifecycle {
-    prevent_destroy = true
-  }
-}
+    # Local emulation bypass settings
+    skip_credentials_validation = true
+    skip_metadata_api_check     = true
+    skip_requesting_account_id  = true
+    skip_region_validation      = true
+    use_path_style              = true
 
-# Enable versioning so we can roll back state corruption
-resource "aws_s3_bucket_versioning" "enabled" {
-  bucket = aws_s3_bucket.terraform_state.id
-  versioning_configuration {
-    status = "Enabled"
-  }
-}
-
-# Server-side encryption by default
-resource "aws_s3_bucket_server_side_encryption_configuration" "default" {
-  bucket = aws_s3_bucket.terraform_state.id
-
-  rule {
-    apply_server_side_encryption_by_default {
-      sse_algorithm = "AES256"
+    endpoints = {
+      s3       = "http://localhost:4566"
+      dynamodb = "http://localhost:4566"
+      sts      = "http://localhost:4566"
     }
-  }
-}
-
-# Explicitly block all public access to the state file
-resource "aws_s3_bucket_public_access_block" "public_access" {
-  bucket                  = aws_s3_bucket.terraform_state.id
-  block_public_acls       = true
-  block_public_policy     = true
-  ignore_public_acls      = true
-  restrict_public_buckets = true
-}
-
-# 2. DynamoDB for State Locking
-resource "aws_dynamodb_table" "terraform_locks" {
-  name         = "enterprise-tf-locks"
-  billing_mode = "PAY_PER_REQUEST"
-  hash_key     = "LockID" # This exact string and casing is mandatory for Terraform
-
-  attribute {
-    name = "LockID"
-    type = "S"
   }
 }
