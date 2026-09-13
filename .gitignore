@@ -15,6 +15,7 @@ override.tf.json
 
 # visualizer
 .pluralith
+Pluralith_Diagram*.pdf
 
 # vscode
 .vscode
